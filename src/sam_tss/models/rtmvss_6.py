@@ -1,22 +1,23 @@
 """
 RTMVSS-6: SAM2-Based Real-Time Multispectral Video Semantic Segmentation Model
 
-Architecture overview:
-  1. Dual-stream HiERA backbone (SAM2-inspired Hierarchical Vision Transformer)
-       - Four stages: 1/4, 1/8, 1/16, 1/32 resolution
-       - Window-based self-attention for efficiency; global attention at deep stages
-       - Relative positional biases within each attention window
-  2. Cross-modal attention fusion (RGB ↔ IR) at multiple feature scales
-  3. SAM2-style key-value memory attention for temporal video context
-  4. FPN-style multi-scale decoder (top-down + lateral connections)
-  5. Multi-class segmentation head with per-modality auxiliary outputs
+Architecture overview (uses SAM2 pretrained components):
+  1. Dual-stream SAM2 ImageEncoder (Hiera trunk + FPN neck)
+       - RGB and IR streams each load SAM2 pretrained weights
+       - Four stages: 1/4, 1/8, 1/16, 1/32 resolution, all projected to 256-d by FPN
+       - After scalp=1: three FPN levels at 1/4, 1/8, 1/16 (all 256-d)
+  2. Cross-modal attention fusion (RGB ↔ IR) at each FPN level
+  3. SAM2 MemoryEncoder: compact 64-d encoding of current fused features
+  4. SAM2 MemoryAttention: cross-attention over stored temporal memory bank
+  5. Segmentation head: FPN-style upsample → dense per-class prediction
 
-Improvements over the MVNet baseline:
-  - Hierarchical ViT backbone (vs ResNet-50 + ASPP)
-  - Cross-modal cross-attention fusion (vs simple concatenation)
-  - Attention-based temporal memory bank (vs class-prototype memory)
-  - FPN decoder leverages multi-scale context (vs DeepLabv3+ single-scale decoder)
-  - DropPath + LayerScale regularisation for improved generalisation
+Loading SAM2 pretrained weights:
+    model.load_sam2_pretrained("path/to/sam2.1_hiera_t.pt")
+    Variant configs:
+        "hiera_tiny"      – embed_dim=96,  ~38 M params total
+        "hiera_small"     – embed_dim=96,  ~46 M params total
+        "hiera_base_plus" – embed_dim=112, ~80 M params total
+        "hiera_large"     – embed_dim=144, ~224 M params total
 
 Input/output interface is fully compatible with the existing MVNet training loop:
   forward(rgb_seq, ir_seq, step=0, epoch=0)
@@ -24,28 +25,76 @@ Input/output interface is fully compatible with the existing MVNet training loop
 """
 
 import logging
-import math
 import random
 import warnings
 from collections import deque
-from typing import List, Optional, Tuple
+from functools import partial
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# SAM2 modules (requires: pip install sam2)
+from sam2.modeling.backbones.hieradet import Hiera
+from sam2.modeling.backbones.image_encoder import FpnNeck, ImageEncoder
+from sam2.modeling.memory_attention import MemoryAttention, MemoryAttentionLayer
+from sam2.modeling.memory_encoder import (
+    CXBlock,
+    Fuser,
+    MaskDownSampler,
+    MemoryEncoder,
+)
+from sam2.modeling.position_encoding import PositionEmbeddingSine
+from sam2.modeling.sam.transformer import RoPEAttention
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# SAM2 variant configurations
+# ---------------------------------------------------------------------------
+
+#: Maps variant name → kwargs for Hiera trunk and FPN backbone_channel_list.
+SAM2_VARIANTS: Dict[str, Dict] = {
+    "hiera_tiny": dict(
+        embed_dim=96,
+        num_heads=1,
+        stages=(1, 2, 7, 2),
+        global_att_blocks=(5, 7, 9),
+        window_pos_embed_bkg_spatial_size=(7, 7),
+        backbone_channel_list=[768, 384, 192, 96],
+    ),
+    "hiera_small": dict(
+        embed_dim=96,
+        num_heads=1,
+        stages=(1, 2, 11, 2),
+        global_att_blocks=(7, 10, 13),
+        window_pos_embed_bkg_spatial_size=(7, 7),
+        backbone_channel_list=[768, 384, 192, 96],
+    ),
+    "hiera_base_plus": dict(
+        embed_dim=112,
+        num_heads=2,
+        stages=(2, 3, 16, 3),
+        global_att_blocks=(12, 17, 21),
+        window_pos_embed_bkg_spatial_size=(7, 7),
+        backbone_channel_list=[896, 448, 224, 112],
+    ),
+    "hiera_large": dict(
+        embed_dim=144,
+        num_heads=2,
+        stages=(2, 6, 36, 4),
+        global_att_blocks=(23, 33, 43),
+        window_pos_embed_bkg_spatial_size=(7, 7),
+        backbone_channel_list=[1152, 576, 288, 144],
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _to_2tuple(x):
-    if isinstance(x, (list, tuple)):
-        return x
-    return (x, x)
-
 
 class LayerNorm2d(nn.Module):
     """Channel-first LayerNorm for 4-D tensors (B, C, H, W)."""
@@ -57,331 +106,101 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W)
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
         return self.weight[:, None, None] * x + self.bias[:, None, None]
 
 
-def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
-    """Stochastic depth / DropPath regularisation."""
-    if drop_prob == 0.0 or not training:
-        return x
-    keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    # Bernoulli mask: 1 = keep, 0 = drop; scale kept values to maintain expectation
-    mask = torch.rand(shape, dtype=x.dtype, device=x.device) < keep_prob
-    return x.div(keep_prob) * mask.to(x.dtype)
+# ---------------------------------------------------------------------------
+# SAM2 ImageEncoder builder
+# ---------------------------------------------------------------------------
 
-
-class DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return drop_path(x, self.drop_prob, self.training)
+def _build_sam2_image_encoder(variant: str) -> ImageEncoder:
+    """Build a SAM2 ImageEncoder (trunk + FPN neck) for the given variant."""
+    cfg = SAM2_VARIANTS[variant]
+    trunk = Hiera(
+        embed_dim=cfg["embed_dim"],
+        num_heads=cfg["num_heads"],
+        stages=cfg["stages"],
+        global_att_blocks=cfg["global_att_blocks"],
+        window_pos_embed_bkg_spatial_size=cfg["window_pos_embed_bkg_spatial_size"],
+    )
+    neck = FpnNeck(
+        position_encoding=PositionEmbeddingSine(num_pos_feats=256, normalize=True),
+        d_model=256,
+        backbone_channel_list=cfg["backbone_channel_list"],
+        fpn_top_down_levels=[2, 3],
+        fpn_interp_model="nearest",
+    )
+    # scalp=1 drops the finest (1/4 stride-4) level from the FPN output, keeping
+    # three levels at strides 8, 16, 32 (all projected to 256-d by the FPN neck).
+    return ImageEncoder(trunk=trunk, neck=neck, scalp=1)
 
 
 # ---------------------------------------------------------------------------
-# Patch Embedding (overlapping, 4× downsampling via two stride-2 convolutions)
+# SAM2 MemoryEncoder builder (no-mask variant)
 # ---------------------------------------------------------------------------
 
-class PatchEmbed(nn.Module):
+def _build_sam2_memory_encoder() -> MemoryEncoder:
+    """Build a SAM2 MemoryEncoder that encodes pixel features without mask conditioning."""
+    return MemoryEncoder(
+        out_dim=64,
+        position_encoding=PositionEmbeddingSine(num_pos_feats=64, normalize=True),
+        mask_downsampler=MaskDownSampler(kernel_size=3, stride=2, padding=1),
+        fuser=Fuser(
+            layer=CXBlock(dim=256, kernel_size=7, padding=3, use_dwconv=True),
+            num_layers=2,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SAM2 MemoryAttention builder
+# ---------------------------------------------------------------------------
+
+def _build_sam2_memory_attention(feat_W: int, feat_H: int) -> MemoryAttention:
     """
-    Overlapping patch embedding that maps (B, in_chans, H, W) →
-    (B, embed_dim, H/4, W/4) using two stride-2 convolutions separated by
-    a channel-first LayerNorm.
+    Build a SAM2 MemoryAttention module for feature maps of spatial size (feat_H, feat_W).
+
+    ``feat_sizes=(feat_W, feat_H)`` must match the actual memory feature map to
+    pre-compute RoPE frequencies correctly (avoids the broken square-map fallback
+    inside RoPEAttention when feat_H != feat_W).
     """
-
-    def __init__(self, in_chans: int = 3, embed_dim: int = 96):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_chans, embed_dim // 2, kernel_size=3, stride=2, padding=1, bias=False),
-            LayerNorm2d(embed_dim // 2),
-            nn.GELU(),
-            nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
-            LayerNorm2d(embed_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
-
-
-# ---------------------------------------------------------------------------
-# Window-based multi-head self-attention with relative positional biases
-# ---------------------------------------------------------------------------
-
-class WindowAttention(nn.Module):
-    """
-    Window-based multi-head self-attention (W-MSA) with relative positional
-    biases, as used in Swin Transformer and SAM2's HiERA backbone.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        window_size: Tuple[int, int],
-        num_heads: int,
-        qkv_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.window_size = window_size  # (Wh, Ww)
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-
-        # Relative positional bias table: (2Wh-1) × (2Ww-1) entries
-        self.rel_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
-        )
-        nn.init.trunc_normal_(self.rel_bias_table, std=0.02)
-
-        # Pre-compute relative position indices
-        coords_h = torch.arange(window_size[0])
-        coords_w = torch.arange(window_size[1])
-        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # 2, Wh, Ww
-        coords_flat = torch.flatten(coords, 1)  # 2, Wh*Ww
-        rel = coords_flat[:, :, None] - coords_flat[:, None, :]  # 2, N, N
-        rel = rel.permute(1, 2, 0).contiguous()
-        rel[:, :, 0] += window_size[0] - 1
-        rel[:, :, 1] += window_size[1] - 1
-        rel[:, :, 0] *= 2 * window_size[1] - 1
-        rel_idx = rel.sum(-1)  # N, N
-        self.register_buffer("rel_idx", rel_idx)
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (num_windows*B, N, C)
-        B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-
-        # Add relative positional bias
-        rel_bias = self.rel_bias_table[self.rel_idx.view(-1)].view(
-            self.window_size[0] * self.window_size[1],
-            self.window_size[0] * self.window_size[1],
-            -1,
-        )  # N, N, num_heads
-        rel_bias = rel_bias.permute(2, 0, 1).contiguous().unsqueeze(0)  # 1, heads, N, N
-        attn = attn + rel_bias
-
-        attn = self.softmax(attn)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        return self.proj_drop(self.proj(x))
-
-
-# ---------------------------------------------------------------------------
-# Window partition utilities
-# ---------------------------------------------------------------------------
-
-def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
-    """Partition feature map into non-overlapping windows."""
-    B, H, W, C = x.shape
-    # Pad if necessary
-    pad_h = (window_size - H % window_size) % window_size
-    pad_w = (window_size - W % window_size) % window_size
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-    Hp, Wp = H + pad_h, W + pad_w
-    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    return windows.view(-1, window_size * window_size, C), (Hp, Wp)
-
-
-def window_reverse(windows: torch.Tensor, window_size: int, Hp: int, Wp: int, H: int, W: int) -> torch.Tensor:
-    """Reconstruct feature map from windows."""
-    B = int(windows.shape[0] / (Hp * Wp / window_size / window_size))
-    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
-    if Hp > H or Wp > W:
-        x = x[:, :H, :W, :].contiguous()
-    return x
-
-
-# ---------------------------------------------------------------------------
-# HiERA Transformer Block (SAM2-inspired)
-# ---------------------------------------------------------------------------
-
-class HiERABlock(nn.Module):
-    """
-    Hierarchical Encoder with Relative-position-biased Attention (HiERA) block.
-    Uses windowed attention by default; set window_size=0 for global attention.
-    Includes LayerScale and DropPath for training stability.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        window_size: int = 7,
-        mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        drop: float = 0.0,
-        attn_drop: float = 0.0,
-        drop_path: float = 0.0,
-        act_layer: nn.Module = nn.GELU,
-        layer_scale_init: float = 1e-5,
-    ):
-        super().__init__()
-        self.window_size = window_size
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-
-        ws = (window_size, window_size) if window_size > 0 else (1, 1)
-        self.attn = WindowAttention(
-            dim, window_size=ws, num_heads=num_heads,
-            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
-        )
-
-        mlp_hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_hidden),
-            act_layer(),
-            nn.Dropout(drop),
-            nn.Linear(mlp_hidden, dim),
-            nn.Dropout(drop),
-        )
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
-        self.gamma1 = nn.Parameter(layer_scale_init * torch.ones(dim))
-        self.gamma2 = nn.Parameter(layer_scale_init * torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W)  channel-first
-        B, C, H, W = x.shape
-        x_seq = x.permute(0, 2, 3, 1)  # (B, H, W, C)
-
-        shortcut = x_seq
-        x_seq = self.norm1(x_seq)
-
-        if self.window_size > 0:
-            # Window attention
-            x_win, (Hp, Wp) = window_partition(x_seq, self.window_size)
-            x_win = self.attn(x_win)
-            x_seq = window_reverse(x_win, self.window_size, Hp, Wp, H, W)
-        else:
-            # Global attention: flatten spatial dims
-            x_flat = x_seq.view(B, H * W, C)
-            x_flat = self.attn(x_flat)
-            x_seq = x_flat.view(B, H, W, C)
-
-        x_seq = shortcut + self.drop_path(self.gamma1 * x_seq)
-        x_seq = x_seq + self.drop_path(self.gamma2 * self.mlp(self.norm2(x_seq)))
-        return x_seq.permute(0, 3, 1, 2)  # back to (B, C, H, W)
-
-
-# ---------------------------------------------------------------------------
-# Hierarchical Downsampling
-# ---------------------------------------------------------------------------
-
-class PatchMerging(nn.Module):
-    """2× spatial downsampling via strided convolution (channel doubling)."""
-
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.norm = LayerNorm2d(in_dim)
-        self.reduction = nn.Conv2d(in_dim, out_dim, kernel_size=2, stride=2, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.reduction(self.norm(x))
-
-
-# ---------------------------------------------------------------------------
-# Hierarchical Encoder (SAM2-style HiERA backbone)
-# ---------------------------------------------------------------------------
-
-class HiERAEncoder(nn.Module):
-    """
-    Four-stage hierarchical ViT encoder inspired by SAM2's HiERA backbone.
-
-    Stage resolutions (relative to input):
-      Stage 0: 1/4   (after PatchEmbed)
-      Stage 1: 1/8   (after PatchMerging)
-      Stage 2: 1/16  (after PatchMerging)
-      Stage 3: 1/32  (after PatchMerging)
-
-    Args:
-        in_chans:    Input channels (3 for RGB, 3 for IR replicated to match)
-        embed_dim:   Base embedding dimension (doubles each stage)
-        depths:      Number of transformer blocks per stage
-        num_heads:   Number of attention heads per stage
-        window_size: Attention window size (0 = global attention)
-        mlp_ratio:   MLP expansion ratio
-        drop_path_rate: Stochastic depth decay rate
-    """
-
-    def __init__(
-        self,
-        in_chans: int = 3,
-        embed_dim: int = 96,
-        depths: Tuple[int, ...] = (2, 2, 6, 2),
-        num_heads: Tuple[int, ...] = (3, 6, 12, 24),
-        window_size: int = 7,
-        mlp_ratio: float = 4.0,
-        drop_path_rate: float = 0.1,
-        global_attn_stages: Tuple[int, ...] = (3,),
-    ):
-        super().__init__()
-        self.num_stages = len(depths)
-        dims = [embed_dim * (2 ** i) for i in range(self.num_stages)]
-
-        # Stochastic depth schedule
-        total_blocks = sum(depths)
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_blocks)]
-        block_idx = 0
-
-        self.patch_embed = PatchEmbed(in_chans, embed_dim)
-
-        self.stages = nn.ModuleList()
-        self.downsamples = nn.ModuleList()
-
-        for stage_idx in range(self.num_stages):
-            ws = 0 if stage_idx in global_attn_stages else window_size
-            stage_blocks = nn.Sequential(*[
-                HiERABlock(
-                    dim=dims[stage_idx],
-                    num_heads=num_heads[stage_idx],
-                    window_size=ws,
-                    mlp_ratio=mlp_ratio,
-                    drop_path=dpr[block_idx + i],
-                )
-                for i in range(depths[stage_idx])
-            ])
-            self.stages.append(stage_blocks)
-            block_idx += depths[stage_idx]
-
-            if stage_idx < self.num_stages - 1:
-                self.downsamples.append(PatchMerging(dims[stage_idx], dims[stage_idx + 1]))
-
-        self.out_dims = dims  # [96, 192, 384, 768] for embed_dim=96
-
-        # Per-stage output norms
-        self.norms = nn.ModuleList([LayerNorm2d(d) for d in dims])
-
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Returns list of 4 feature maps at 1/4, 1/8, 1/16, 1/32 resolution."""
-        x = self.patch_embed(x)
-        features = []
-        for i, stage in enumerate(self.stages):
-            x = stage(x)
-            features.append(self.norms[i](x))
-            if i < self.num_stages - 1:
-                x = self.downsamples[i](x)
-        return features
+    feat_sizes = (feat_W, feat_H)
+    return MemoryAttention(
+        d_model=256,
+        pos_enc_at_input=True,
+        layer=MemoryAttentionLayer(
+            activation="relu",
+            dim_feedforward=2048,
+            dropout=0.1,
+            pos_enc_at_attn=False,
+            d_model=256,
+            pos_enc_at_cross_attn_keys=True,
+            pos_enc_at_cross_attn_queries=False,
+            self_attention=RoPEAttention(
+                rope_theta=10000.0,
+                feat_sizes=feat_sizes,
+                embedding_dim=256,
+                num_heads=1,
+                downsample_rate=1,
+                dropout=0.1,
+            ),
+            cross_attention=RoPEAttention(
+                rope_theta=10000.0,
+                feat_sizes=feat_sizes,
+                rope_k_repeat=True,
+                embedding_dim=256,
+                num_heads=1,
+                downsample_rate=1,
+                dropout=0.1,
+                kv_in_dim=64,
+            ),
+        ),
+        num_layers=4,
+        batch_first=True,  # SAM2 default; input/output remain seq-first (S,B,C)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +217,6 @@ class CrossModalAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, reduction: int = 4):
         super().__init__()
         inner = max(dim // reduction, 32)
-        # Ensure inner is divisible by num_heads; pick largest valid num_heads
         original_heads = num_heads
         for nh in [num_heads, 8, 4, 2, 1]:
             if inner % nh == 0:
@@ -419,64 +237,39 @@ class CrossModalAttention(nn.Module):
         self.q_ir = nn.Conv2d(dim, inner, 1)
         self.kv_rgb = nn.Conv2d(dim, inner * 2, 1)
 
-        self.proj_rgb = nn.Sequential(
-            nn.Conv2d(inner, dim, 1),
-            LayerNorm2d(dim),
-        )
-        self.proj_ir = nn.Sequential(
-            nn.Conv2d(inner, dim, 1),
-            LayerNorm2d(dim),
-        )
+        self.proj_rgb = nn.Sequential(nn.Conv2d(inner, dim, 1), LayerNorm2d(dim))
+        self.proj_ir = nn.Sequential(nn.Conv2d(inner, dim, 1), LayerNorm2d(dim))
 
-        # Gating: learn how much cross-modal information to admit
         self.gate_rgb = nn.Sequential(nn.Conv2d(dim * 2, dim, 1), nn.Sigmoid())
         self.gate_ir = nn.Sequential(nn.Conv2d(dim * 2, dim, 1), nn.Sigmoid())
 
         self.norm_rgb = LayerNorm2d(dim)
         self.norm_ir = LayerNorm2d(dim)
 
-    def _attn(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        H: int,
-        W: int,
-    ) -> torch.Tensor:
+    def _attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, H: int, W: int) -> torch.Tensor:
         B, C, _, _ = q.shape
-        nh = self.num_heads
-        hd = C // nh
-
-        # Flatten spatial to sequence
+        nh, hd = self.num_heads, self.head_dim
         q = q.flatten(2).permute(0, 2, 1).view(B, H * W, nh, hd).permute(0, 2, 1, 3)
         k = k.flatten(2).permute(0, 2, 1).view(B, H * W, nh, hd).permute(0, 2, 1, 3)
         v = v.flatten(2).permute(0, 2, 1).view(B, H * W, nh, hd).permute(0, 2, 1, 3)
-
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         out = (attn @ v).permute(0, 2, 1, 3).reshape(B, H * W, C)
         return out.permute(0, 2, 1).view(B, C, H, W)
 
-    def forward(
-        self, f_rgb: torch.Tensor, f_ir: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, f_rgb: torch.Tensor, f_ir: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, H, W = f_rgb.shape
-
-        # RGB attends to IR
         q_r = self.q_rgb(self.norm_rgb(f_rgb))
         kv_i = self.kv_ir(self.norm_ir(f_ir))
         k_i, v_i = kv_i.chunk(2, dim=1)
-        rgb_cross = self._attn(q_r, k_i, v_i, H, W)
-        rgb_cross = self.proj_rgb(rgb_cross)
+        rgb_cross = self.proj_rgb(self._attn(q_r, k_i, v_i, H, W))
         gate_r = self.gate_rgb(torch.cat([f_rgb, rgb_cross], dim=1))
         f_rgb_out = f_rgb + gate_r * rgb_cross
 
-        # IR attends to RGB
         q_i = self.q_ir(self.norm_ir(f_ir))
         kv_r = self.kv_rgb(self.norm_rgb(f_rgb))
         k_r, v_r = kv_r.chunk(2, dim=1)
-        ir_cross = self._attn(q_i, k_r, v_r, H, W)
-        ir_cross = self.proj_ir(ir_cross)
+        ir_cross = self.proj_ir(self._attn(q_i, k_r, v_r, H, W))
         gate_i = self.gate_ir(torch.cat([f_ir, ir_cross], dim=1))
         f_ir_out = f_ir + gate_i * ir_cross
 
@@ -484,208 +277,11 @@ class CrossModalAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SAM2-Inspired Memory Attention
-# ---------------------------------------------------------------------------
-
-class MemoryEncoder(nn.Module):
-    """
-    Compresses current-frame features into a (key, value) pair for the memory
-    bank.  A lightweight convolution first projects the features; keys and
-    values are then produced by separate 1×1 convolutions.
-    """
-
-    def __init__(self, in_dim: int, mem_dim: int = 64):
-        super().__init__()
-        self.compress = nn.Sequential(
-            nn.Conv2d(in_dim, mem_dim, 1, bias=False),
-            LayerNorm2d(mem_dim),
-            nn.GELU(),
-        )
-        self.key_proj = nn.Conv2d(mem_dim, mem_dim, 1)
-        self.val_proj = nn.Conv2d(mem_dim, mem_dim, 1)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = self.compress(x)
-        return self.key_proj(z), self.val_proj(z)
-
-
-class MemoryAttention(nn.Module):
-    """
-    SAM2-style memory attention module.
-
-    At each time step the current-frame features attend to a bank of (key,
-    value) pairs drawn from previous frames.  A learnable query projection maps
-    the current features to queries; the retrieved memory is blended back via
-    a gated residual.
-
-    Memory bank layout:  keys/values stored as lists of (B, mem_dim, H', W')
-    tensors; up to ``max_mem`` entries are kept (FIFO).
-    """
-
-    def __init__(self, in_dim: int, mem_dim: int = 64, num_heads: int = 4, max_mem: int = 5):
-        super().__init__()
-        self.mem_dim = mem_dim
-        self.num_heads = num_heads
-        self.head_dim = mem_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.max_mem = max_mem
-
-        self.query_proj = nn.Sequential(
-            nn.Conv2d(in_dim, mem_dim, 1, bias=False),
-            LayerNorm2d(mem_dim),
-        )
-        self.out_proj = nn.Sequential(
-            nn.Conv2d(mem_dim, in_dim, 1, bias=False),
-            LayerNorm2d(in_dim),
-        )
-        self.gate = nn.Sequential(
-            nn.Conv2d(in_dim * 2, in_dim, 1),
-            nn.Sigmoid(),
-        )
-
-    # ------------------------------------------------------------------
-    # Bank management (stateful, reset per video clip)
-    # ------------------------------------------------------------------
-
-    def init_bank(self):
-        self._key_bank: deque = deque(maxlen=self.max_mem)
-        self._val_bank: deque = deque(maxlen=self.max_mem)
-
-    def update_bank(self, key: torch.Tensor, val: torch.Tensor):
-        """Add a new (key, value) pair; oldest entry is evicted automatically."""
-        self._key_bank.append(key)
-        self._val_bank.append(val)
-
-    def bank_size(self) -> int:
-        return len(self._key_bank)
-
-    # ------------------------------------------------------------------
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: current frame features (B, in_dim, H, W)
-        Returns:
-            x enriched with temporal memory context, same shape
-        """
-        if self.bank_size() == 0:
-            return x  # no memory yet – pass through unchanged
-
-        B, C, H, W = x.shape
-        nh, hd = self.num_heads, self.head_dim
-
-        # Query from current frame
-        q = self.query_proj(x)  # (B, mem_dim, H, W)
-        q = q.flatten(2).permute(0, 2, 1)  # (B, HW, mem_dim)
-        q = q.view(B, H * W, nh, hd).permute(0, 2, 1, 3)  # (B, nh, HW, hd)
-
-        # Keys and values from memory bank
-        # Each entry: (B, mem_dim, Hm, Wm)
-        keys = torch.stack(list(self._key_bank), dim=2)  # (B, mem_dim, T, Hm, Wm)
-        vals = torch.stack(list(self._val_bank), dim=2)
-        T, Hm, Wm = keys.shape[2], keys.shape[3], keys.shape[4]
-
-        # Flatten memory spatial + temporal dims
-        k = keys.permute(0, 2, 3, 4, 1).reshape(B, T * Hm * Wm, self.mem_dim)
-        v = vals.permute(0, 2, 3, 4, 1).reshape(B, T * Hm * Wm, self.mem_dim)
-
-        k = k.view(B, -1, nh, hd).permute(0, 2, 1, 3)  # (B, nh, TN, hd)
-        v = v.view(B, -1, nh, hd).permute(0, 2, 1, 3)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, nh, HW, TN)
-        attn = attn.softmax(dim=-1)
-        mem_out = (attn @ v).permute(0, 2, 1, 3).reshape(B, H * W, self.mem_dim)
-        mem_out = mem_out.permute(0, 2, 1).view(B, self.mem_dim, H, W)
-        mem_out = self.out_proj(mem_out)
-
-        gate = self.gate(torch.cat([x, mem_out], dim=1))
-        return x + gate * mem_out
-
-
-# ---------------------------------------------------------------------------
-# FPN-Style Multi-Scale Decoder
-# ---------------------------------------------------------------------------
-
-class FPNDecoder(nn.Module):
-    """
-    Feature Pyramid Network (FPN) decoder with top-down pathway.
-
-    Takes four feature maps (1/4, 1/8, 1/16, 1/32) and fuses them top-down,
-    producing a single feature map at 1/4 resolution.
-    """
-
-    def __init__(self, in_dims: List[int], out_dim: int = 256):
-        super().__init__()
-        # Lateral convolutions (reduce each stage to out_dim)
-        self.lateral = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(d, out_dim, 1, bias=False),
-                LayerNorm2d(out_dim),
-            )
-            for d in in_dims
-        ])
-        # Top-down fusion convolutions
-        self.fuse = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False),
-                LayerNorm2d(out_dim),
-                nn.GELU(),
-            )
-            for _ in range(len(in_dims) - 1)
-        ])
-
-    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
-        """
-        features: list of 4 tensors at [1/4, 1/8, 1/16, 1/32] resolution.
-        Returns:  single tensor at 1/4 resolution.
-        """
-        # Apply lateral projections
-        laterals = [lat(f) for lat, f in zip(self.lateral, features)]
-
-        # Top-down merge: start from the coarsest (index 3) and go up
-        out = laterals[-1]
-        for i in range(len(laterals) - 2, -1, -1):
-            out = F.interpolate(out, size=laterals[i].shape[-2:], mode="bilinear", align_corners=False)
-            out = laterals[i] + out
-            out = self.fuse[i](out)
-
-        return out  # (B, out_dim, H/4, W/4)
-
-
-# ---------------------------------------------------------------------------
-# Segmentation Head
-# ---------------------------------------------------------------------------
-
-class SegHead(nn.Module):
-    """Dense segmentation head with two refinement convolutions."""
-
-    def __init__(self, in_dim: int, num_classes: int, dropout: float = 0.1):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_dim, in_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(in_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(in_dim, in_dim // 2, 3, padding=1, bias=False),
-            nn.BatchNorm2d(in_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_dim // 2, num_classes, 1),
-        )
-
-    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        x = self.conv(x)
-        return F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
-
-
-# ---------------------------------------------------------------------------
-# Multimodal Fusion at each FPN level
+# Modality Fusion (SE channel attention)
 # ---------------------------------------------------------------------------
 
 class ModalFuse(nn.Module):
-    """
-    Fuses RGB and IR FPN features into a single representation.
-    Uses a channel-attention (SE-like) mechanism before element-wise addition.
-    """
+    """Fuses RGB and IR features via SE channel-attention and 1×1 conv."""
 
     def __init__(self, dim: int):
         super().__init__()
@@ -710,26 +306,67 @@ class ModalFuse(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Memory Queue (state management per video clip)
+# Segmentation Head
 # ---------------------------------------------------------------------------
 
-class MemoryBank:
-    """Simple FIFO memory bank wrapping three MemoryAttention modules."""
+class SegHead(nn.Module):
+    """Dense segmentation head: refine FPN features and upsample to full resolution."""
 
-    def __init__(self):
-        self.rgb_attn: Optional[MemoryAttention] = None
-        self.ir_attn: Optional[MemoryAttention] = None
-        self.fused_attn: Optional[MemoryAttention] = None
+    def __init__(self, in_dim: int, num_classes: int, dropout: float = 0.1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_dim, in_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(in_dim, in_dim // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_dim // 2, num_classes, 1),
+        )
 
-    def register(self, rgb_attn: "MemoryAttention", ir_attn: "MemoryAttention", fused_attn: "MemoryAttention"):
-        self.rgb_attn = rgb_attn
-        self.ir_attn = ir_attn
-        self.fused_attn = fused_attn
+    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        x = self.conv(x)
+        return F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
 
-    def reset(self):
-        for m in (self.rgb_attn, self.ir_attn, self.fused_attn):
-            if m is not None:
-                m.init_bank()
+
+# ---------------------------------------------------------------------------
+# Multi-scale decoder: fuses 3 SAM2 FPN levels → 1/4 res feature map
+# ---------------------------------------------------------------------------
+
+class FPNSegDecoder(nn.Module):
+    """
+    Top-down FPN decoder over the 3 SAM2 FPN levels (all 256-d at 1/4, 1/8, 1/16).
+    Produces a single 256-d feature map at 1/4 resolution.
+    """
+
+    def __init__(self, fpn_dim: int = 256):
+        super().__init__()
+        # Refinement convs after top-down merge
+        self.fuse = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(fpn_dim, fpn_dim, 3, padding=1, bias=False),
+                LayerNorm2d(fpn_dim),
+                nn.GELU(),
+            )
+            for _ in range(2)  # 2 merges: level2→level1, level1→level0
+        ])
+
+    def forward(self, fpn_feats: List[torch.Tensor]) -> torch.Tensor:
+        """
+        fpn_feats: [level0 (1/4), level1 (1/8), level2 (1/16)] – all 256-d.
+        Returns: (B, 256, H/4, W/4)
+        """
+        # Start from coarsest
+        out = fpn_feats[2]
+        out = F.interpolate(out, size=fpn_feats[1].shape[-2:], mode="nearest")
+        out = fpn_feats[1] + out
+        out = self.fuse[0](out)
+
+        out = F.interpolate(out, size=fpn_feats[0].shape[-2:], mode="nearest")
+        out = fpn_feats[0] + out
+        out = self.fuse[1](out)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -738,115 +375,140 @@ class MemoryBank:
 
 class RTMVSS6(nn.Module):
     """
-    RTMVSS-6: SAM2-Based Real-Time Multispectral Video Semantic Segmentation.
+    RTMVSS-6: Real-Time Multispectral Video Semantic Segmentation using SAM2.
+
+    Uses SAM2's pretrained ImageEncoder (Hiera + FPN), MemoryEncoder, and
+    MemoryAttention modules.  Adds cross-modal attention (RGB ↔ IR) and a
+    segmentation head on top.
+
+    Temporal memory: each processed frame is encoded into 64-d memory tokens by
+    SAM2's MemoryEncoder and stored in a FIFO deque (up to ``max_mem`` frames).
+    On the first frame (empty bank) memory attention is skipped and the current
+    features are used directly; from the second frame onwards SAM2's
+    MemoryAttention enriches current features with stored past context.
 
     Args:
-        num_classes:      Number of semantic classes (default: 26 for MVSeg).
-        embed_dim:        Base channel dimension of HiERA backbone (default: 96).
-        depths:           Number of transformer blocks per stage.
-        num_heads:        Attention heads per stage.
-        window_size:      Attention window size for windowed stages.
-        fpn_dim:          Channel dimension of FPN feature maps.
-        mem_dim:          Channel dimension of memory bank keys/values.
-        max_mem:          Maximum number of frames stored in memory.
-        drop_path_rate:   Maximum stochastic depth probability.
-        share_backbone:   If True, RGB and IR streams share backbone weights.
-        stm_queue_size:   Alias for max_mem (for compatibility with MVNet args).
-        sample_rate:      Frame sampling strategy (unused; for compatibility).
-        memory_strategy:  Memory update strategy ("all" or "random").
-        always_decode:    Whether to produce predictions for every frame.
-        baseline_mode:    Disable memory when True (ablation).
+        num_classes:      Semantic classes (default 26 for MVSeg).
+        sam2_variant:     One of "hiera_tiny", "hiera_small", "hiera_base_plus",
+                          "hiera_large".  Selects the SAM2 backbone variant.
+        img_size:         Spatial size (H, W) of input frames.  Used to compute
+                          memory feature size (H/16, W/16) for correct RoPE init.
+        max_mem:          Max stored memory frames (FIFO deque).
+        share_encoder:    Share ImageEncoder weights between RGB and IR streams.
+        memory_strategy:  "all" or "random" frame sampling.
+        always_decode:    Produce output for every frame (not just the last).
+        baseline_mode:    Disable temporal memory (ablation).
+        stm_queue_size:   Alias for max_mem (MVNet compatibility).
+        sample_rate:      Unused; kept for API compatibility.
     """
 
     def __init__(
         self,
         num_classes: int = 26,
+        sam2_variant: str = "hiera_tiny",
+        img_size: Tuple[int, int] = (320, 480),
+        max_mem: int = 5,
+        share_encoder: bool = False,
+        memory_strategy: str = "all",
+        always_decode: bool = False,
+        baseline_mode: bool = False,
+        # MVNet-compatibility kwargs
+        stm_queue_size: int = 5,
+        sample_rate: int = 1,
+        # Legacy backbone kwargs (ignored when using SAM2 modules, kept for compat)
         embed_dim: int = 96,
         depths: Tuple[int, ...] = (2, 2, 6, 2),
         num_heads: Tuple[int, ...] = (3, 6, 12, 24),
         window_size: int = 7,
         fpn_dim: int = 256,
         mem_dim: int = 64,
-        max_mem: int = 5,
         drop_path_rate: float = 0.1,
         share_backbone: bool = False,
-        # Compatibility kwargs (may be passed as an args namespace)
-        stm_queue_size: int = 5,
-        sample_rate: int = 1,
-        memory_strategy: str = "all",
-        always_decode: bool = False,
-        baseline_mode: bool = False,
     ):
         super().__init__()
+        if sam2_variant not in SAM2_VARIANTS:
+            raise ValueError(f"sam2_variant must be one of {list(SAM2_VARIANTS)}; got {sam2_variant!r}")
+
         self.num_classes = num_classes
+        self.sam2_variant = sam2_variant
+        self.img_size = img_size
         self.max_mem = max(max_mem, stm_queue_size)
         self.memory_strategy = memory_strategy
         self.always_decode = always_decode
         self.baseline_mode = baseline_mode
-        self.share_backbone = share_backbone
+        self.share_encoder = share_encoder or share_backbone
 
-        # ---- Backbone ----
-        backbone_kwargs = dict(
-            in_chans=3,
-            embed_dim=embed_dim,
-            depths=depths,
-            num_heads=num_heads,
-            window_size=window_size,
-            drop_path_rate=drop_path_rate,
-        )
-        self.backbone_rgb = HiERAEncoder(**backbone_kwargs)
-        if share_backbone:
-            self.backbone_ir = self.backbone_rgb
+        # Memory feature map size: stride-16 of the input
+        self._mem_H = img_size[0] // 16
+        self._mem_W = img_size[1] // 16
+
+        # ---- SAM2 Image Encoders (RGB + IR) ----
+        self.encoder_rgb = _build_sam2_image_encoder(sam2_variant)
+        if self.share_encoder:
+            self.encoder_ir = self.encoder_rgb
         else:
-            self.backbone_ir = HiERAEncoder(**backbone_kwargs)
+            self.encoder_ir = _build_sam2_image_encoder(sam2_variant)
 
-        stage_dims = self.backbone_rgb.out_dims  # e.g. [96, 192, 384, 768]
+        # SAM2 FPN output: 3 levels at [H/4, H/8, H/16], all 256-d (after scalp=1)
+        _fpn_dim = 256
 
-        # ---- Cross-modal attention at each scale ----
+        # ---- Cross-modal attention (RGB ↔ IR) at each FPN level ----
         self.cross_modal = nn.ModuleList([
-            CrossModalAttention(d, num_heads=min(d // 32, 8) or 1)
-            for d in stage_dims
+            CrossModalAttention(_fpn_dim, num_heads=8)
+            for _ in range(3)
         ])
 
-        # ---- Memory encoder (operates on bottleneck features, stage 3) ----
-        bottleneck_dim = stage_dims[-1]
-        self.mem_encoder_rgb = MemoryEncoder(bottleneck_dim, mem_dim)
-        self.mem_encoder_ir = MemoryEncoder(bottleneck_dim, mem_dim)
-        self.mem_encoder_fused = MemoryEncoder(bottleneck_dim, mem_dim)
-
-        # ---- Memory attention modules ----
-        self.mem_attn_rgb = MemoryAttention(bottleneck_dim, mem_dim, num_heads=4, max_mem=self.max_mem)
-        self.mem_attn_ir = MemoryAttention(bottleneck_dim, mem_dim, num_heads=4, max_mem=self.max_mem)
-        self.mem_attn_fused = MemoryAttention(bottleneck_dim, mem_dim, num_heads=4, max_mem=self.max_mem)
-
-        # ---- Modality fusion before FPN ----
-        self.modal_fuse = nn.ModuleList([ModalFuse(d) for d in stage_dims])
+        # ---- Modality fusion at each FPN level ----
+        self.modal_fuse = nn.ModuleList([ModalFuse(_fpn_dim) for _ in range(3)])
 
         # ---- FPN decoders (one per modality stream) ----
-        self.fpn_rgb = FPNDecoder(stage_dims, fpn_dim)
-        self.fpn_ir = FPNDecoder(stage_dims, fpn_dim)
-        self.fpn_fused = FPNDecoder(stage_dims, fpn_dim)
+        self.fpn_dec_rgb = FPNSegDecoder(_fpn_dim)
+        self.fpn_dec_ir = FPNSegDecoder(_fpn_dim)
+        self.fpn_dec_fused = FPNSegDecoder(_fpn_dim)
+
+        # ---- SAM2 Memory Encoder (fused stream, no mask conditioning) ----
+        self.memory_encoder = _build_sam2_memory_encoder()
+
+        # ---- SAM2 Memory Attention ----
+        self.memory_attention = _build_sam2_memory_attention(
+            feat_W=self._mem_W, feat_H=self._mem_H
+        )
+
+        # Temporal positional encoding for memory slots (SAM2 style)
+        self.maskmem_tpos_enc = nn.Parameter(
+            torch.zeros(self.max_mem, 1, 1, 64)  # (max_mem, 1, 1, mem_dim)
+        )
+        nn.init.trunc_normal_(self.maskmem_tpos_enc, std=0.02)
+
+        # Project memory-enriched features (256-d) back to 256-d for decoder
+        self.mem_out_proj = nn.Sequential(
+            nn.Conv2d(_fpn_dim, _fpn_dim, 1, bias=False),
+            LayerNorm2d(_fpn_dim),
+        )
 
         # ---- Segmentation heads ----
-        self.seg_head_rgb = SegHead(fpn_dim, num_classes)
-        self.seg_head_ir = SegHead(fpn_dim, num_classes)
-        self.seg_head_fused = SegHead(fpn_dim, num_classes)
-        # Final ensemble head
+        self.seg_head_rgb = SegHead(_fpn_dim, num_classes)
+        self.seg_head_ir = SegHead(_fpn_dim, num_classes)
+        self.seg_head_fused = SegHead(_fpn_dim, num_classes)
         self.seg_head_final = nn.Conv2d(num_classes * 3, num_classes, 1)
 
-        # ---- Memory bank state ----
-        self._mem_bank = MemoryBank()
-        self._mem_bank.register(self.mem_attn_rgb, self.mem_attn_ir, self.mem_attn_fused)
-        self.reset_hidden_state()
+        # ---- Memory bank (stateful) ----
+        self._mem_bank: deque = deque(maxlen=self.max_mem)
 
+        self.reset_hidden_state()
         self._init_weights()
 
     # ------------------------------------------------------------------
-    # Initialisation
+    # Weight init (only non-SAM2 modules need explicit init)
     # ------------------------------------------------------------------
 
     def _init_weights(self):
-        for m in self.modules():
+        for name, m in self.named_modules():
+            # Skip SAM2 encoder modules – they are initialised by SAM2
+            if name.startswith("encoder_rgb") or name.startswith("encoder_ir"):
+                continue
+            if name.startswith("memory_encoder") or name.startswith("memory_attention"):
+                continue
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
@@ -860,12 +522,67 @@ class RTMVSS6(nn.Module):
                 nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------
+    # Pretrained weight loading
+    # ------------------------------------------------------------------
+
+    def load_sam2_pretrained(
+        self,
+        ckpt_path: str,
+        load_encoder: bool = True,
+        load_memory: bool = True,
+        strict: bool = False,
+    ) -> None:
+        """
+        Load SAM2 pretrained weights from a checkpoint file.
+
+        Args:
+            ckpt_path:    Path to the SAM2 .pt checkpoint.
+            load_encoder: Load image_encoder weights into both RGB and IR encoders.
+            load_memory:  Load memory_encoder and memory_attention weights.
+            strict:       Whether to require all checkpoint keys to match.
+        """
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        state = ckpt.get("model", ckpt)
+
+        loaded, skipped = 0, 0
+
+        def _load_submodule(module: nn.Module, prefix: str):
+            nonlocal loaded, skipped
+            sub_state = {
+                k[len(prefix):]: v
+                for k, v in state.items()
+                if k.startswith(prefix)
+            }
+            result = module.load_state_dict(sub_state, strict=strict)
+            loaded += len(sub_state)
+            if result.missing_keys:
+                logger.debug("Missing keys in %s: %s", prefix, result.missing_keys[:5])
+            if result.unexpected_keys:
+                skipped += len(result.unexpected_keys)
+
+        if load_encoder:
+            _load_submodule(self.encoder_rgb, "image_encoder.")
+            if not self.share_encoder:
+                _load_submodule(self.encoder_ir, "image_encoder.")
+            logger.info("Loaded image_encoder weights from %s", ckpt_path)
+
+        if load_memory:
+            _load_submodule(self.memory_encoder, "memory_encoder.")
+            _load_submodule(self.memory_attention, "memory_attention.")
+            logger.info("Loaded memory_encoder + memory_attention weights from %s", ckpt_path)
+
+        logger.info(
+            "SAM2 pretrained load: %d tensors loaded, %d skipped from %s",
+            loaded, skipped, ckpt_path,
+        )
+
+    # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
 
     def reset_hidden_state(self):
-        """Reset memory banks (call at the start of each new video clip)."""
-        self._mem_bank.reset()
+        """Reset temporal memory bank (call at the start of each new clip)."""
+        self._mem_bank.clear()
 
     # ------------------------------------------------------------------
     # Memory range selection
@@ -875,96 +592,139 @@ class RTMVSS6(nn.Module):
         if self.memory_strategy == "random":
             if seq_len <= 1:
                 return list(range(seq_len))
-            # Select up to (max_mem - 1) context frames from all but the last frame,
-            # then always include the final (query) frame.
             n_context = min(self.max_mem - 1, seq_len - 1)
             r = random.sample(range(seq_len - 1), n_context)
             r.append(seq_len - 1)
             return sorted(r)
-        return list(range(seq_len))  # "all"
+        return list(range(seq_len))
 
     # ------------------------------------------------------------------
-    # Single-frame encode → fuse → decode
+    # Per-frame encode + cross-modal fuse
     # ------------------------------------------------------------------
 
     def _encode_frame(
         self, rgb: torch.Tensor, ir: torch.Tensor
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """Extract and cross-fuse multi-scale features for one frame."""
-        feats_rgb = self.backbone_rgb(rgb)
-        feats_ir = self.backbone_ir(ir)
-
-        # Cross-modal attention at each scale
-        fused_feats_rgb, fused_feats_ir = [], []
-        for i, (fr, fi, cm) in enumerate(zip(feats_rgb, feats_ir, self.cross_modal)):
-            fr2, fi2 = cm(fr, fi)
-            fused_feats_rgb.append(fr2)
-            fused_feats_ir.append(fi2)
-
-        # Modality-fused features (for the fusion stream)
-        fused_feats = [self.modal_fuse[i](fused_feats_rgb[i], fused_feats_ir[i])
-                       for i in range(len(feats_rgb))]
-
-        return fused_feats_rgb, fused_feats_ir, fused_feats
-
-    def _apply_memory(
-        self,
-        feats_rgb: List[torch.Tensor],
-        feats_ir: List[torch.Tensor],
-        feats_fused: List[torch.Tensor],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """Apply memory attention to the bottleneck (deepest) feature map.
-
-        Only the bottleneck (last) element is affected by memory; shallow feature
-        maps are passed through unchanged.  We clone only the bottleneck to
-        avoid modifying the caller's tensors while minimising memory overhead.
         """
-        f_rgb = feats_rgb[:-1] + [self.mem_attn_rgb(feats_rgb[-1].clone())]
-        f_ir = feats_ir[:-1] + [self.mem_attn_ir(feats_ir[-1].clone())]
-        f_fused = feats_fused[:-1] + [self.mem_attn_fused(feats_fused[-1].clone())]
-        return f_rgb, f_ir, f_fused
+        Run SAM2 encoders on a single (B, 3, H, W) frame pair.
+        Returns three lists of 3 FPN features (all 256-d): rgb, ir, fused.
+        """
+        enc_rgb = self.encoder_rgb(rgb)   # dict: backbone_fpn, vision_features, vision_pos_enc
+        enc_ir = self.encoder_ir(ir)
+
+        fpn_rgb = enc_rgb["backbone_fpn"]  # [f0(H/4), f1(H/8), f2(H/16)]
+        fpn_ir = enc_ir["backbone_fpn"]
+
+        # Cross-modal attention at each FPN level
+        out_rgb, out_ir = list(fpn_rgb), list(fpn_ir)
+        for i, cm in enumerate(self.cross_modal):
+            out_rgb[i], out_ir[i] = cm(out_rgb[i], out_ir[i])
+
+        # Modality fusion at each FPN level
+        fused = [self.modal_fuse[i](out_rgb[i], out_ir[i]) for i in range(3)]
+
+        return out_rgb, out_ir, fused
+
+    # ------------------------------------------------------------------
+    # Memory operations (SAM2-style)
+    # ------------------------------------------------------------------
+
+    def _apply_memory_attention(
+        self,
+        fused_fpn: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """
+        Apply SAM2 MemoryAttention to the coarsest (1/16) fused FPN level.
+        Returns updated FPN list with enriched coarsest level.
+        When the memory bank is empty (first frame), returns features unchanged.
+        """
+        if len(self._mem_bank) == 0:
+            # No stored memory yet: skip memory attention on the first frame
+            return fused_fpn
+
+        B, C, H_m, W_m = fused_fpn[2].shape  # (B, 256, H/16, W/16)
+
+        # Current frame features in seq-first format (S, B, C)
+        curr = fused_fpn[2].flatten(2).permute(2, 0, 1)     # (H*W, B, 256)
+        curr_pos = curr.new_zeros(H_m * W_m, B, 256)
+
+        # Gather stored memory entries: each is (B, 64, Hm, Wm) + (B, 64, Hm, Wm)
+        mem_list, pos_list = [], []
+        bank_len = len(self._mem_bank)
+        for slot_idx, entry in enumerate(self._mem_bank):
+            feat = entry["vision_features"]   # (B, 64, Hm, Wm)
+            pos = entry["vision_pos_enc"]      # (B, 64, Hm, Wm)
+            # Flatten spatial dims → (Hm*Wm, B, 64) for seq-first format
+            f_seq = feat.flatten(2).permute(2, 0, 1)
+            p_seq = pos.flatten(2).permute(2, 0, 1)
+            # Temporal positional encoding: slot 0 is the oldest entry in the deque,
+            # so t_pos_idx 0 = oldest frame, bank_len-1 = most recently stored frame.
+            t_pos_idx = min(bank_len - 1 - slot_idx, self.max_mem - 1)
+            t_enc = self.maskmem_tpos_enc[t_pos_idx]  # (1, 1, 64)
+            p_seq = p_seq + t_enc.view(1, 1, 64).expand_as(p_seq)
+            mem_list.append(f_seq)
+            pos_list.append(p_seq)
+        memory = torch.cat(mem_list, dim=0)       # (T*Hm*Wm, B, 64)
+        memory_pos = torch.cat(pos_list, dim=0)
+
+        enriched = self.memory_attention(
+            curr=curr,
+            memory=memory,
+            curr_pos=curr_pos,
+            memory_pos=memory_pos,
+        )  # (S, B, 256)
+        # Reshape back to (B, 256, Hm, Wm) and residual-add
+        enriched = enriched.permute(1, 2, 0).view(B, C, H_m, W_m)
+        enriched = self.mem_out_proj(enriched)
+
+        return fused_fpn[:2] + [fused_fpn[2] + enriched]
+
+
+    def _memorise_frame(self, fused_fpn: List[torch.Tensor]) -> None:
+        """
+        Encode the fused bottleneck features and push to memory bank.
+        Passes zero masks (skip_mask_sigmoid=True) so only pixel features are used.
+        """
+        pix_feat = fused_fpn[2]  # (B, 256, Hm, Wm)
+        B, _, H_in_scale, W_in_scale = pix_feat.shape
+        # MemoryEncoder expects masks at the original image resolution (H, W).
+        # With skip_mask_sigmoid=True the mask is added after sigmoid, and passing
+        # zeros is a no-op (skip_mask_sigmoid skips sigmoid; mask contribution = 0).
+        mask_zeros = pix_feat.new_zeros(B, 1, self.img_size[0], self.img_size[1])
+        enc = self.memory_encoder(pix_feat, mask_zeros, skip_mask_sigmoid=True)
+        # SAM2's MemoryEncoder wraps vision_pos_enc in a list (PositionEmbeddingSine
+        # returns a list for compatibility with multi-level use; we take the first element).
+        pos_enc = enc["vision_pos_enc"]
+        pos_enc = pos_enc[0] if isinstance(pos_enc, list) else pos_enc
+        self._mem_bank.append({
+            "vision_features": enc["vision_features"].detach(),
+            "vision_pos_enc": pos_enc.detach(),
+        })
+
+    # ------------------------------------------------------------------
+    # Per-frame decode
+    # ------------------------------------------------------------------
 
     def _decode_frame(
         self,
-        feats_rgb: List[torch.Tensor],
-        feats_ir: List[torch.Tensor],
-        feats_fused: List[torch.Tensor],
-        h: int,
-        w: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run FPN decoders and segmentation heads for one frame."""
-        fpn_r = self.fpn_rgb(feats_rgb)
-        fpn_i = self.fpn_ir(feats_ir)
-        fpn_f = self.fpn_fused(feats_fused)
+        fpn_rgb: List[torch.Tensor],
+        fpn_ir: List[torch.Tensor],
+        fpn_fused: List[torch.Tensor],
+        H: int,
+        W: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        f_rgb_dec = self.fpn_dec_rgb(fpn_rgb)
+        f_ir_dec = self.fpn_dec_ir(fpn_ir)
+        f_fused_dec = self.fpn_dec_fused(fpn_fused)
 
-        pred_rgb = self.seg_head_rgb(fpn_r, h, w)
-        pred_ir = self.seg_head_ir(fpn_i, h, w)
-        pred_fused = self.seg_head_fused(fpn_f, h, w)
-
-        # Final ensemble: concatenate and project
-        pred_final = self.seg_head_final(
-            torch.cat([pred_rgb, pred_ir, pred_fused], dim=1)
-        )
-
-        return pred_final, pred_rgb, pred_ir, pred_fused
-
-    def _memorise_frame(
-        self,
-        feats_rgb: List[torch.Tensor],
-        feats_ir: List[torch.Tensor],
-        feats_fused: List[torch.Tensor],
-    ):
-        """Encode current bottleneck features and push to memory bank."""
-        k_r, v_r = self.mem_encoder_rgb(feats_rgb[-1])
-        k_i, v_i = self.mem_encoder_ir(feats_ir[-1])
-        k_f, v_f = self.mem_encoder_fused(feats_fused[-1])
-
-        self.mem_attn_rgb.update_bank(k_r, v_r)
-        self.mem_attn_ir.update_bank(k_i, v_i)
-        self.mem_attn_fused.update_bank(k_f, v_f)
+        p_r = self.seg_head_rgb(f_rgb_dec, H, W)
+        p_i = self.seg_head_ir(f_ir_dec, H, W)
+        p_f = self.seg_head_fused(f_fused_dec, H, W)
+        pred = self.seg_head_final(torch.cat([p_r, p_i, p_f], dim=1))
+        return pred, p_r, p_i, p_f
 
     # ------------------------------------------------------------------
-    # Forward pass
+    # Forward
     # ------------------------------------------------------------------
 
     def forward(
@@ -978,14 +738,14 @@ class RTMVSS6(nn.Module):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
-        Optional[list],
+        None,
     ]:
         """
         Args:
-            rgb_seq:  (B, T, 3, H, W) visible-spectrum frames.
-            ir_seq:   (B, T, 3, H, W) infrared/thermal frames.
-            step:     Global training step (unused directly; kept for compat).
-            epoch:    Training epoch (unused directly; kept for compat).
+            rgb_seq:  (B, T, 3, H, W) RGB sequence.
+            ir_seq:   (B, T, 3, H, W) IR / thermal sequence.
+            step:     Global training step (unused; kept for API compat).
+            epoch:    Training epoch (unused; kept for API compat).
 
         Returns:
             output_decoder:       (B, T_out, num_classes, H, W)
@@ -998,40 +758,35 @@ class RTMVSS6(nn.Module):
         H, W = int(rgb_seq.shape[3]), int(rgb_seq.shape[4])
 
         mem_range = self._memory_range(T)
-
         preds, aux_rgb, aux_ir, aux_fused = [], [], [], []
 
         for t in mem_range:
             rgb_t = rgb_seq[:, t]
             ir_t = ir_seq[:, t]
 
-            # Encode
-            feats_rgb, feats_ir, feats_fused = self._encode_frame(rgb_t, ir_t)
+            fpn_rgb, fpn_ir, fpn_fused = self._encode_frame(rgb_t, ir_t)
 
             if self.baseline_mode:
-                # No memory
                 if not (self.always_decode or t == T - 1):
                     continue
-                pred, p_r, p_i, p_f = self._decode_frame(feats_rgb, feats_ir, feats_fused, H, W)
+                pred, p_r, p_i, p_f = self._decode_frame(fpn_rgb, fpn_ir, fpn_fused, H, W)
                 preds.append(pred)
                 aux_rgb.append(p_r)
                 aux_ir.append(p_i)
                 aux_fused.append(p_f)
                 continue
 
-            # Apply memory attention then decode for the *query* frame
+            # Decode the query frame with memory-enriched features
             if self.always_decode or t == T - 1:
-                f_r, f_i, f_f = self._apply_memory(feats_rgb, feats_ir, feats_fused)
-                pred, p_r, p_i, p_f = self._decode_frame(f_r, f_i, f_f, H, W)
+                mem_fpn = self._apply_memory_attention(fpn_fused)
+                pred, p_r, p_i, p_f = self._decode_frame(fpn_rgb, fpn_ir, mem_fpn, H, W)
                 preds.append(pred)
                 aux_rgb.append(p_r)
                 aux_ir.append(p_i)
                 aux_fused.append(p_f)
 
-            # Memorise frames: context frames always, query frame too so it can
-            # serve as context for future windows (important in streaming mode).
-            if not self.baseline_mode:
-                self._memorise_frame(feats_rgb, feats_ir, feats_fused)
+            # Memorise this frame (all frames, including the query)
+            self._memorise_frame(fpn_fused)
 
         output_decoder = torch.stack(preds, dim=1)
         outputs_aux_rgb = torch.stack(aux_rgb, dim=1) if aux_rgb else None
@@ -1046,83 +801,20 @@ class RTMVSS6(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_rtmvss6_from_args(args) -> RTMVSS6:
-    """Construct RTMVSS6 from an argparse Namespace compatible with MVNet."""
-    # Map dataset → num_classes
-    from datasets.helpers import DATASETS_NUM_CLASSES
-    num_classes = DATASETS_NUM_CLASSES[args.dataset]
+    """
+    Build RTMVSS6 from an argparse Namespace (MVNet-compatible).
 
-    # Size variant controlled by backbone name
-    variant = getattr(args, "backbone", "hiera_tiny")
-    if "small" in variant:
-        embed_dim, depths, heads = 96, (2, 2, 9, 2), (3, 6, 12, 24)
-    elif "base" in variant or "sam2" in variant:
-        embed_dim, depths, heads = 112, (2, 3, 16, 3), (4, 8, 16, 16)
-    elif "large" in variant:
-        embed_dim, depths, heads = 144, (2, 6, 36, 4), (6, 12, 24, 24)
-    else:  # default / tiny
-        embed_dim, depths, heads = 96, (2, 2, 6, 2), (3, 6, 12, 24)
-
-    return RTMVSS6(
-        num_classes=num_classes,
-        embed_dim=embed_dim,
-        depths=depths,
-        num_heads=heads,
-        window_size=getattr(args, "window_size", 7),
-        fpn_dim=256,
-        mem_dim=64,
-        max_mem=getattr(args, "stm_queue_size", 5),
-        drop_path_rate=getattr(args, "drop_path_rate", 0.1),
-        share_backbone=getattr(args, "share_backbone", False),
-        memory_strategy=getattr(args, "memory_strategy", "all"),
-        always_decode=getattr(args, "always_decode", False),
-        baseline_mode=getattr(args, "baseline_mode", False),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Quick self-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="MVSeg")
-    parser.add_argument("--backbone", default="hiera_tiny")
-    parser.add_argument("--stm-queue-size", type=int, default=3)
-    parser.add_argument("--memory-strategy", default="all")
-    parser.add_argument("--always-decode", action="store_true")
-    parser.add_argument("--baseline-mode", action="store_true")
-    parser.add_argument("--window-size", type=int, default=7)
-    parser.add_argument("--drop-path-rate", type=float, default=0.1)
-    parser.add_argument("--share-backbone", action="store_true")
-    args = parser.parse_args()
-
-    model = RTMVSS6(
-        num_classes=26,
-        embed_dim=96,
-        depths=(2, 2, 6, 2),
-        num_heads=(3, 6, 12, 24),
-        window_size=7,
-        stm_queue_size=args.stm_queue_size,
-        memory_strategy=args.memory_strategy,
-        always_decode=args.always_decode,
-        baseline_mode=args.baseline_mode,
-    )
-    model.eval()
-
-    B, T, C, H, W = 2, 4, 3, 320, 480
-    rgb = torch.randn(B, T, C, H, W)
-    ir = torch.randn(B, T, C, H, W)
-
-    with torch.no_grad():
-        out, aux_r, aux_i, aux_f, _ = model(rgb, ir)
-
-    print(f"Output shape:      {out.shape}")         # (2, 1, 26, 320, 480)
-    print(f"Aux RGB shape:     {aux_r.shape}")
-    print(f"Aux IR shape:      {aux_i.shape}")
-    print(f"Aux fusion shape:  {aux_f.shape}")
-
-    # Parameter count
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Parameters: {n_params:.1f} M")
+    Recognised attributes (all optional, fall back to RTMVSS6 defaults):
+        num_classes, sam2_variant, img_size, max_mem, share_encoder,
+        memory_strategy, always_decode, baseline_mode, stm_queue_size,
+        sample_rate.
+    """
+    kwargs = {}
+    for key in (
+        "num_classes", "sam2_variant", "img_size", "max_mem", "share_encoder",
+        "memory_strategy", "always_decode", "baseline_mode",
+        "stm_queue_size", "sample_rate",
+    ):
+        if hasattr(args, key):
+            kwargs[key] = getattr(args, key)
+    return RTMVSS6(**kwargs)
